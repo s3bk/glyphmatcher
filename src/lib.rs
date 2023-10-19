@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, fmt::Display};
+use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, fmt::Display, sync::{RwLock, Arc}};
 
 use font::{TrueTypeFont, CffFont, OpenTypeFont, opentype::cmap::CMap, GlyphId, Glyph, Font};
 use istring::SmallString;
@@ -23,7 +23,7 @@ impl<I> ShapeDb<I> {
 fn add_font(db_dir: &Path, font_file: &Path) {
     let data = std::fs::read(&font_file).unwrap();
     let font = font::parse(&data).unwrap();
-    let ps_name = match font.name().postscript_name {
+    let ps_name = match dbg!(&font.name().postscript_name) {
         Some(ref n) => n,
         None => {
             println!("no postscript name");
@@ -138,9 +138,15 @@ impl<I: Display> ShapeDb<I> {
         let mut candiates: Vec<_> = candiates.into_iter().collect();
         candiates.sort_by_key(|t| t.1);
         
-        for &(idx, n) in candiates.iter().rev().take(3) {
+        for &(idx, n) in candiates.iter().rev() {
             let (ref s, ref contours) = self.entries[idx];
+            if let Some(report) = report.as_deref_mut() {
+                writeln!(report, "<div>candiate <span>{s}</span>");
+            };
             if contours.len() != outline.contours().len() {
+                if let Some(report) = report.as_deref_mut() {
+                    writeln!(report, " incorrect number of contours {} != {}</div>", contours.len(), outline.len());
+                }
                 continue;
             }
 
@@ -154,12 +160,17 @@ impl<I: Display> ShapeDb<I> {
 
                     if t_s == *r_s {
                         used[r_c_i] = true;
+                    } else {
+                        if let Some(report) = report.as_deref_mut() {
+                            let i = t_s.difference(r_s).count();
+                            writeln!(report, " {} of {} points do not match", i, t_s.len());
+                        }
                     }
                 }
             }
 
             if let Some(report) = report.as_deref_mut() {
-                writeln!(report, "<p>Unicode: <span>{s}</span>, {used:?}</p>").unwrap();
+                writeln!(report, "<p>Unicode: <span>{s}</span>, {used:?}</p></div>").unwrap();
             }
             if used.iter().all(|&b| b) {
                 return Some(s);
@@ -173,14 +184,8 @@ fn points_set(contour: &Contour) -> HashSet<(u16, u16)> {
     contour.points().iter().map(|p| (p.x() as u16, p.y() as u16)).collect()
 }
 
-pub fn check_font(db_path: &Path, ps_name: &str, font: &(dyn Font + Sync + Send), mut report: Option<&mut String>) -> Option<HashMap<GlyphId, SmallString>> {
+pub fn check_font(db: &ShapeDb<SmallString>, ps_name: &str, font: &(dyn Font + Sync + Send), mut report: Option<&mut String>) -> Option<HashMap<GlyphId, SmallString>> {
     use std::fmt::Write;
-
-    let file_path = db_path.join(ps_name);
-    if !file_path.is_file() {
-        return None;
-    }
-    let db: ShapeDb<SmallString> = postcard::from_bytes(&std::fs::read(&file_path).unwrap()).unwrap();
 
     if let Some(report) = report.as_deref_mut() {
         report.push_str(r#"<!DOCTYPE html>
@@ -209,20 +214,19 @@ p > span {
     let mut map = HashMap::new();
 
     for i in 0 .. font.num_glyphs() {
-
-        let g = font.glyph(GlyphId(i)).unwrap();
-        if g.path.len() > 0 {
-
+        if let Some(g) = font.glyph(GlyphId(i)) {
             if g.path.len() > 0 {
-                if let Some(report) = report.as_deref_mut() {
-                    writeln!(report, r#"<div class="test">"#).unwrap();
-                    write_glyph(report, &g.path);
-                }
-                if let Some(s) = db.get(&g.path, report.as_deref_mut()) {
-                    map.insert(GlyphId(i), s.clone());
-                }
-                if let Some(report) = report.as_deref_mut() {
-                    writeln!(report, "</div>").unwrap();
+                if g.path.len() > 0 {
+                    if let Some(report) = report.as_deref_mut() {
+                        writeln!(report, r#"<div class="test">"#).unwrap();
+                        write_glyph(report, &g.path);
+                    }
+                    if let Some(s) = db.get(&g.path, report.as_deref_mut()) {
+                        map.insert(GlyphId(i), s.clone());
+                    }
+                    if let Some(report) = report.as_deref_mut() {
+                        writeln!(report, "</div>").unwrap();
+                    }
                 }
             }
         }
@@ -243,17 +247,40 @@ fn write_glyph(w: &mut String, path: &Outline) {
 }
 
 pub struct FontDb {
-    path: PathBuf
+    path: PathBuf,
+    cache: RwLock<HashMap<String, Option<Arc<ShapeDb<SmallString>>>>>,
 }
 impl FontDb {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        FontDb { path: path.into() }
+        FontDb { path: path.into(), cache: Default::default() }
     }
     pub fn scan(&self) {
         init(&self.path)
     }
-    pub fn check_font(&self, ps_name: &str, font: &(dyn Font + Sync + Send)) -> Option<HashMap<GlyphId, SmallString>> {
-        check_font(&self.path, ps_name, font, None)
+    fn get_db(&self, ps_name: &str) -> Option<Arc<ShapeDb<SmallString>>> {
+        if let Some(cached) = self.cache.read().unwrap().get(ps_name) {
+            return cached.clone();
+        }
+
+        let file_path = self.path.join(ps_name);
+        let db = if file_path.is_file() {
+            Some(Arc::new(postcard::from_bytes(&std::fs::read(&file_path).unwrap()).unwrap()))
+        } else {
+            None
+        };
+        self.cache.write().unwrap().insert(ps_name.into(), db.clone());
+        db
+    }
+    pub fn font_report(&self, ps_name: &str, font: &(dyn Font + Sync + Send)) -> String {
+        let mut report = String::new();
+        let db = self.get_db(ps_name).unwrap();
+        check_font(&db, ps_name, font, Some(&mut report));
+        report
+    }
+    pub fn check_font(&self, ps_name: &str, font: &(dyn Font + Sync + Send)) -> Option<Arc<HashMap<GlyphId, SmallString>>> {
+        let db = self.get_db(ps_name)?;
+        let out = check_font(&db, ps_name, font, None).map(Arc::new);
+        out
     }
     pub fn add_font(&self, font_path: &Path) {
         add_font(&self.path, font_path)
