@@ -9,7 +9,9 @@ edition = "2021"
 font = { git = "https://github.com/pdf-rs/font" }
 pdf_encoding = { git = "https://github.com/pdf-rs/encoding" }
 pathfinder_content = { git = "https://github.com/servo/pathfinder/" }
+pathfinder_geometry = { git = "https://github.com/servo/pathfinder/" }
 itertools = "*"
 serde = { version = "*", features = ["derive"] }
 postcard = { version = "1.0", features = ["alloc"] }
 istring = { git = "https://github.com/s3bk/istring", features = ["serialize"] }
+serde_json = "*"
