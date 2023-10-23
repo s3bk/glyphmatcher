@@ -2,20 +2,33 @@ use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, fmt::Display, 
 
 use font::{TrueTypeFont, CffFont, OpenTypeFont, opentype::cmap::CMap, GlyphId, Glyph, Font};
 use istring::SmallString;
-use pathfinder_content::outline::{Outline, Contour};
+use itertools::Itertools;
+use pathfinder_content::outline::{Contour, Outline};
+use pathfinder_geometry::vector::Vector2F;
 use pdf_encoding::glyphname_to_unicode;
 use serde::{Deserialize, Serialize};
 
+use crate::frechet::frechet_distance;
+
+pub mod frechet;
+
+#[derive(Serialize, Deserialize)]
+struct Entry<I> {
+    contour_sets: Vec<HashSet<(u16, u16)>>,
+   // outline: Outline,
+    data: I,
+}
+ 
 #[derive(Serialize, Deserialize)]
 pub struct ShapeDb<I> {
-    entries: Vec<(I, Vec<HashSet<(u16, u16)>>)>,
+    entries: Vec<Entry<I>>,
     points: HashMap<(u16, u16), Vec<usize>>,
 }
 impl<I> ShapeDb<I> {
     pub fn new() -> Self {
         ShapeDb {
             entries: vec![],
-            points: HashMap::new()
+            points: HashMap::new(),
         }
     }
 }
@@ -27,10 +40,29 @@ fn add_font(db_dir: &Path, font_file: &Path) {
         Some(ref n) => n,
         None => {
             println!("no postscript name");
-            return;
+            font_file.file_stem().unwrap().to_str().unwrap()
         }
     };
-    if let Some(db) = read_font(&*font) {
+    let use_name = font_file.extension().map(|s| s == "name").unwrap_or(false);
+
+    let mut db = ShapeDb::new();
+
+    let label_file = Path::new("unicode").join(font_file.file_stem().unwrap()).with_extension("json");
+    let list = if label_file.exists() {
+        println!("loading patch");
+        let list: UnicodeList = serde_json::from_slice(&std::fs::read(&label_file).unwrap()).unwrap();
+        Some(list.into_iter().map(|e| (GlyphId(e.gid), e.unicode.iter().flat_map(|&n| std::char::from_u32(n)).collect())).collect())
+    } else {
+        font_uni_list(&*font, use_name)
+    };
+    if let Some(list) = list {
+
+        for (gid, s) in list {
+            let g = font.glyph(gid).unwrap();
+            
+            db.add_outline(&g.path, s);
+        }
+
         let db_data = postcard::to_allocvec(&db).unwrap();
         std::fs::write(db_dir.join(ps_name), &db_data).unwrap();
     }
@@ -43,39 +75,31 @@ pub fn init(db_dir: &Path) {
         add_font(db_dir, &path);
     }
 }
-pub fn read_font(font: &(dyn Font + Sync + Send)) -> Option<ShapeDb<SmallString>> {
-    let mut db = ShapeDb::new();
 
-    let list = if let Some(ttf) = font.downcast_ref::<TrueTypeFont>() {
+pub fn font_uni_list(font: &(dyn Font + Sync + Send), use_name: bool) -> Option<Vec<(GlyphId, SmallString)>> {
+    if let Some(ttf) = font.downcast_ref::<TrueTypeFont>() {
         println!("TTF");
         if let Some(ref cmap) = ttf.cmap {
-            use_cmap(cmap)
+            Some(use_cmap(cmap))
         } else {
-            return None;
+            None
         }
     } else if let Some(cff) = font.downcast_ref::<CffFont>() {
         println!("CFF");
-        return None;
+        None
     } else if let Some(otf) = font.downcast_ref::<OpenTypeFont>() {
         println!("OTF");
-        if otf.name_map.len() > 0 {
-            use_name_map(&otf.name_map)
+        if use_name && otf.name_map.len() > 0 {
+            Some(use_name_map(&otf.name_map))
         }
         else if let Some(ref cmap) = otf.cmap {
-            use_cmap(cmap)
+            Some(use_cmap(cmap))
         } else {
-            return None;
+            None
         }
     } else {
-        return None;
-    };
-
-    for (gid, s) in list {
-        let g = font.glyph(gid).unwrap();
-        db.add_outline(g.path, s);
+        None
     }
-
-    Some(db)
 }
 
 fn use_cmap(cmap: &CMap) -> Vec<(GlyphId, SmallString)> {
@@ -101,12 +125,12 @@ fn use_name_map(map: &HashMap<String, u16>) -> Vec<(GlyphId, SmallString)> {
     v
 }
 
-impl<I: Display> ShapeDb<I> {
-    pub fn add_outline(&mut self, outline: Outline, value: I) {
+impl<I: Display + PartialEq> ShapeDb<I> {
+    pub fn add_outline(&mut self, outline: &Outline, value: I) {
         let val_idx = self.entries.len();
         let mut points_seen = HashSet::new();
-        for c in outline.contours() {
-            for p in c.points() {
+        for c in outline.contours().iter() {
+            for &p in c.points().iter() {
                 let key = (p.x() as u16, p.y() as u16);
                 if points_seen.insert(key) {
                     self.points.entry(key).or_default().push(val_idx);
@@ -114,16 +138,16 @@ impl<I: Display> ShapeDb<I> {
             }
         }
         let contours = outline.contours().iter().map(points_set).collect();
-        self.entries.push((value, contours));
+        self.entries.push(Entry { data: value, contour_sets: contours });
     }
-    pub fn get(&self, outline: &Outline, mut report: Option<&mut String>) -> Option<&I> {
+    pub fn get(&self, outline: &pathfinder_content::outline::Outline, mut report: Option<&mut String>) -> Option<&I> {
         use std::fmt::Write;
 
         let mut candiates: HashMap<usize, usize> = HashMap::new();
         let mut points_seen = HashSet::new();
 
-        for c in outline.contours() {
-            for p in c.points() {
+        for c in outline.contours().iter() {
+            for &p in c.points().iter() {
                 let key = (p.x() as u16, p.y() as u16);
 
                 if points_seen.insert(key) {
@@ -139,49 +163,93 @@ impl<I: Display> ShapeDb<I> {
         candiates.sort_by_key(|t| t.1);
         
         for &(idx, n) in candiates.iter().rev() {
-            let (ref s, ref contours) = self.entries[idx];
+            let e = &self.entries[idx];
             if let Some(report) = report.as_deref_mut() {
-                writeln!(report, "<div>candiate <span>{s}</span>");
+                writeln!(report, "<div>candiate <span>{}</span>", e.data);
             };
-            if contours.len() != outline.contours().len() {
+            if e.contour_sets.len() != outline.contours().len() {
                 if let Some(report) = report.as_deref_mut() {
-                    writeln!(report, " incorrect number of contours {} != {}</div>", contours.len(), outline.len());
+                    writeln!(report, " incorrect number of contours {} != {}</div>", e.contour_sets.len(), outline.contours().len());
                 }
                 continue;
             }
 
-            let mut used = vec![false; contours.len()];
+            let mut used = vec![false; outline.contours().len()];
             for t_c in outline.contours().iter() {
                 let t_s = points_set(t_c);
-                for (r_c_i, r_s) in contours.iter().enumerate() {
+                for (r_c_i, r_s) in e.contour_sets.iter().enumerate() {
                     if used[r_c_i] {
                         continue;
                     }
 
                     if t_s == *r_s {
                         used[r_c_i] = true;
-                    } else {
-                        if let Some(report) = report.as_deref_mut() {
-                            let i = t_s.difference(r_s).count();
-                            writeln!(report, " {} of {} points do not match", i, t_s.len());
-                        }
                     }
                 }
             }
 
-            if let Some(report) = report.as_deref_mut() {
-                writeln!(report, "<p>Unicode: <span>{s}</span>, {used:?}</p></div>").unwrap();
-            }
             if used.iter().all(|&b| b) {
-                return Some(s);
+                if let Some(report) = report.as_deref_mut() {
+                    writeln!(report, "<p>Unicode: <span>{}</span>, {used:?}</p>", e.data).unwrap();
+                    writeln!(report, "</div>");
+                }
+                return Some(&e.data);
             }
         }
+        /*
+        let mut best_entry = None;
+        for e in self.entries.iter() {
+            let n = outline.0.len();
+            let mut score = vec![0.0; n * n];
+
+            if e.outline.0.len() != outline.0.len() {
+                continue;
+            }
+            for (t_i, t_c) in outline.0.iter().enumerate() {
+                for (r_i, r_c) in e.outline.0.iter().enumerate() {
+                    score[t_i * n + r_i] = frechet_distance(t_c, r_c);
+                }
+            }
+
+            let sum: f32 = score.windows(n).map(|w| w.iter().cloned().reduce(|a, b| min(a, b)).unwrap()).sum();
+
+            if let Some(report) = report.as_deref_mut() {
+                if debug.as_ref().map(|d| *d == e.data).unwrap_or(false) {
+                    for w in score.windows(n) {
+                        for s in w {
+                            print!("  {s:5.0}");
+                        }
+                        println!();
+                    }
+                }
+
+                if sum < 100. * n as f32 {
+                    writeln!(report, "<div><span>{}</span>: {sum}</div>", e.data);
+                }
+            }
+            
+            match best_entry {
+                Some((_, s2)) if sum >= s2 => {}
+                _ => {
+                    best_entry = Some((e, sum));
+                    //println!("{}", score.iter().format(", "));
+                }
+            }
+        }
+        if let Some((e, sum)) = best_entry {
+            if let Some(report) = report.as_deref_mut() {
+                writeln!(report, "<p>Best match: <span>{}</span>, {sum}</p>", e.data).unwrap();
+            }
+            return Some(&e.data);
+        }
+        */
+
         None
     }
 }
 
 fn points_set(contour: &Contour) -> HashSet<(u16, u16)> {
-    contour.points().iter().map(|p| (p.x() as u16, p.y() as u16)).collect()
+    contour.points().iter().map(|&p| (p.x() as u16, p.y() as u16)).collect()
 }
 
 pub fn check_font(db: &ShapeDb<SmallString>, ps_name: &str, font: &(dyn Font + Sync + Send), mut report: Option<&mut String>) -> Option<HashMap<GlyphId, SmallString>> {
@@ -218,7 +286,7 @@ p > span {
             if g.path.len() > 0 {
                 if g.path.len() > 0 {
                     if let Some(report) = report.as_deref_mut() {
-                        writeln!(report, r#"<div class="test">"#).unwrap();
+                        writeln!(report, r#"<div class="test">Glyph {i}"#).unwrap();
                         write_glyph(report, &g.path);
                     }
                     if let Some(s) = db.get(&g.path, report.as_deref_mut()) {
@@ -239,7 +307,7 @@ p > span {
     Some(map)
 }
 
-fn write_glyph(w: &mut String, path: &Outline) {
+fn write_glyph(w: &mut String, path: &pathfinder_content::outline::Outline) {
     use std::fmt::Write;
 
     let b = path.bounds();
@@ -286,3 +354,17 @@ impl FontDb {
         add_font(&self.path, font_path)
     }
 }
+
+pub fn max(a: f32, b: f32) -> f32 {
+    if a > b { a } else { b }
+}
+pub fn min(a: f32, b: f32) -> f32 {
+    if a > b { b } else { a }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct UnicodeEntry {
+    pub gid: u32,
+    pub unicode: Vec<u32>,
+}
+pub type UnicodeList = Vec<UnicodeEntry>;
